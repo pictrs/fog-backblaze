@@ -53,9 +53,15 @@ class Fog::Backblaze::Storage::File < Fog::Model
     service.get_object_url(directory.key, key)
   end
 
-  def url attr
+  # Get a url for file.
+  #
+  # @param expires_at [String|Integer|Time] number of seconds (since 1970-01-01 00:00) before url expires
+  # @param options [Hash]
+  # @return [String] url
+  #
+  def url(expires_at, options = {})
     requires :directory, :key
-    service.get_public_object_url(directory.key, key, {})
+    service.get_public_object_url(directory.key, key, expires_at, options)
   end
 
 end

@@ -191,13 +191,15 @@ class Fog::Backblaze::Storage::Real
   alias_method :get_object_https_url, :get_object_url
 
   # call b2_get_download_authorization
-  def get_public_object_url(bucket_name, file_path, options = {})
+  # options[:expires] number of seconds (since 1970-01-01 00:00) before url expires
+  #
+  def get_public_object_url(bucket_name, file_path, expires = nil, options = {})
+    valid_duration = expires.nil? ? 86400 : (expires.to_i - Time.now.to_i)
     bucket_id = _get_bucket_id!(bucket_name)
-
     result = b2_command(:b2_get_download_authorization, body: {
       bucketId: bucket_id,
       fileNamePrefix: file_path,
-      validDurationInSeconds: 604800
+      validDurationInSeconds: valid_duration
     }.merge(options))
 
     if result.status == 404
@@ -208,7 +210,11 @@ class Fog::Backblaze::Storage::Real
       raise Fog::Errors::NotFound, "Backblaze respond with status = #{result.status} - #{result.reason_phrase}"
     end
 
-    "#{get_object_url(bucket_name, file_path)}?Authorization=#{result.json['authorizationToken']}"
+    public_url = "#{get_object_url(bucket_name, file_path)}?Authorization=#{result.json['authorizationToken']}"
+
+    return public_url unless options[:b2ContentDisposition]
+
+    public_url + '&b2ContentDisposition=' + options[:b2ContentDisposition]
   end
 
   def get_object(bucket_name, file_name)
