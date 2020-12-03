@@ -173,13 +173,13 @@ class Fog::Backblaze::Storage::Real
   # * last_modified - time object or number of miliseconds
   # * content_disposition
   # * extra_headers - hash, list of custom headers
-  def put_object(bucket_name, file_path, local_file_path, options = {})
+  def put_object(bucket_name, file_path, content, options = {})
     bucket_id = _get_bucket_id!(bucket_name)
-    
-    if local_file_path.size / 1024 / 1024 > 50
-      handle_large_object_upload(bucket_id, bucket_name, file_path, local_file_path, options)
+
+    if content.size / 1024 / 1024 > 50
+      handle_large_object_upload(bucket_id, bucket_name, file_path, content, options)
     else
-      handle_small_object_upload(bucket_id, bucket_name, file_path, local_file_path, options)
+      handle_small_object_upload(bucket_id, bucket_name, file_path, content, options)
     end
   end
 
@@ -400,14 +400,24 @@ class Fog::Backblaze::Storage::Real
     @auth_response.json
   end
 
-  def handle_large_object_upload(bucket_id, bucket_name, file_path, local_file_path, options = {})
+  
+  def handle_large_object_upload(bucket_id, bucket_name, file_path, content, options = {})
+    # bad, TODO
+    if content.is_a?(String)
+      file = Tempfile.new('foo', binmode: true)
+      file.write(content)
+      local_file_path = file.path
+      file.close
+    end
     # Start large file upload
+    # content type is required, see
+    # https://www.backblaze.com/b2/docs/b2_start_large_file.html
     start_large_file_response = b2_command(
       :b2_start_large_file, 
       body: {
         bucketId: bucket_id, 
         fileName: file_path, 
-        contentType: options[:content_type] 
+        contentType: options[:content_type] || 'b2/x-auto'
       }
     )
 
@@ -423,7 +433,8 @@ class Fog::Backblaze::Storage::Real
     upload_url = get_upload_part_url_response.json["uploadUrl"]
     minimum_part_size_bytes = @token_cache.auth_response["recommendedPartSize"]
     upload_authorization_token = get_upload_part_url_response.json["authorizationToken"]
-    local_file_size = File.stat(local_file_path).size 
+
+    local_file_size = File.stat(local_file_path).size
     total_bytes_sent = 0
     bytes_sent_for_part = minimum_part_size_bytes
     # SHA1 of each uploaded part. 
@@ -475,14 +486,14 @@ class Fog::Backblaze::Storage::Real
     )
   end
 
-  def handle_small_object_upload(bucket_id, bucket_name, file_path, local_file_path, options = {})
+  def handle_small_object_upload(bucket_id, bucket_name, file_path, content, options = {})
     upload_url = @token_cache.fetch("upload_url/#{bucket_name}") do
       result = b2_command(:b2_get_upload_url, body: {bucketId: bucket_id})
       result.json
     end
 
-    if local_file_path.is_a?(IO)
-      local_file_path = local_file_path.read
+    if content.is_a?(IO)
+      content = content.read
     end
 
     extra_headers = {}
@@ -511,12 +522,12 @@ class Fog::Backblaze::Storage::Real
 
     response = b2_command(nil,
       url: upload_url['uploadUrl'],
-      body: local_file_path,
+      body: content,
       headers: {
         'Authorization': upload_url['authorizationToken'],
         'Content-Type': 'b2/x-auto',
         'X-Bz-File-Name': "#{_esc_file(file_path)}",
-        'X-Bz-Content-Sha1': Digest::SHA1.hexdigest(local_file_path)
+        'X-Bz-Content-Sha1': Digest::SHA1.hexdigest(content)
       }.merge(extra_headers)
     )
 
