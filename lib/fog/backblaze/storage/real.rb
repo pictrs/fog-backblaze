@@ -173,10 +173,14 @@ class Fog::Backblaze::Storage::Real
   # * last_modified - time object or number of miliseconds
   # * content_disposition
   # * extra_headers - hash, list of custom headers
+  # * force_multipart - for tests
   def put_object(bucket_name, file_path, content, options = {})
     bucket_id = _get_bucket_id!(bucket_name)
 
-    if content.size / 1024 / 1024 > 50
+    # This is maybe not the right place at all for deciding to normal/multipart-upload
+    # The guys at fog-aws are going a different way:
+    # https://github.com/fog/fog-aws/blob/b8c6d0421a187bd83786e74939e416dc8b7f1a18/lib/fog/aws/models/storage/file.rb#L223
+    if content.size / 1024 / 1024 > 50 || options[:force_multipart_upload]
       handle_large_object_upload(bucket_id, bucket_name, file_path, content, options)
     else
       handle_small_object_upload(bucket_id, bucket_name, file_path, content, options)
@@ -400,15 +404,18 @@ class Fog::Backblaze::Storage::Real
     @auth_response.json
   end
 
-  
+  # @param [String] bucket_id
+  # @param [String] bucket_name
+  # @param [String] file_path
+  # @param [String, IO] content
+  # @param options [Hash]
+  # @option options [Boolean] :force_multipart  for tests
+  # @return [Excon::Response]
   def handle_large_object_upload(bucket_id, bucket_name, file_path, content, options = {})
-    # bad, TODO
-    if content.is_a?(String)
-      file = Tempfile.new('foo', binmode: true)
-      file.write(content)
-      local_file_path = file.path
-      file.close
-    end
+    require 'net/http'
+
+    content = StringIO.new(content) if content.is_a?(String)
+
     # Start large file upload
     # content type is required, see
     # https://www.backblaze.com/b2/docs/b2_start_large_file.html
@@ -420,9 +427,9 @@ class Fog::Backblaze::Storage::Real
         contentType: options[:content_type] || 'b2/x-auto'
       }
     )
+    file_id = start_large_file_response.json["fileId"]
 
     # Get upload part url
-    file_id = start_large_file_response.json["fileId"]
     get_upload_part_url_response = b2_command(
       :b2_get_upload_part_url,
       body: {
@@ -430,27 +437,26 @@ class Fog::Backblaze::Storage::Real
       }
     )
 
-    upload_url = get_upload_part_url_response.json["uploadUrl"]
-    minimum_part_size_bytes = @token_cache.auth_response["recommendedPartSize"]
+    upload_url                 = get_upload_part_url_response.json["uploadUrl"]
+    # as mentioned above, we choose multipart upload when content is larger than 50M
+    # since backblaze requires at least 2 parts, we have to choose a apropiate chunk size
+    multipart_chunk_size       = 40_000_000 # @token_cache.auth_response["recommendedPartSize"]
+    if options[:force_multipart_upload]
+      length = content.read.size
+      content.rewind
+      multipart_chunk_size = [length / 2, multipart_chunk_size].min
+    end
+
     upload_authorization_token = get_upload_part_url_response.json["authorizationToken"]
 
-    local_file_size = File.stat(local_file_path).size
-    total_bytes_sent = 0
-    bytes_sent_for_part = minimum_part_size_bytes
-    # SHA1 of each uploaded part. 
+    # SHA1 of each uploaded part.
     # You will need to save these because you will need them in b2_finish_large_file
-    sha1_of_parts = Array.new
+    sha1_of_parts = []
     sha1_part_index = 1
-    while total_bytes_sent < local_file_size do
-      # Determine num bytes to send 
-      if ((local_file_size - total_bytes_sent) < minimum_part_size_bytes) 
-        bytes_sent_for_part = (local_file_size - total_bytes_sent)
-      end
-
-      # Read file into memory and calculate a SHA1
-      file_part_data = File.read(local_file_path, bytes_sent_for_part, total_bytes_sent, mode: "rb")
-      sha1_of_parts.push(Digest::SHA1.hexdigest(file_part_data))
-      hex_digest_of_part = sha1_of_parts[sha1_part_index - 1]
+    while (chunk = content.read(multipart_chunk_size)) do
+      # SHA1 of chunk
+      hex_digest_of_part = Digest::SHA1.hexdigest(chunk)
+      sha1_of_parts.push(hex_digest_of_part)
 
       # Send it over the wire
       uri = URI(upload_url)
@@ -458,32 +464,32 @@ class Fog::Backblaze::Storage::Real
       req.add_field("Authorization", upload_authorization_token)
       req.add_field("X-Bz-Part-Number", sha1_part_index)
       req.add_field("X-Bz-Content-Sha1", hex_digest_of_part)
-      req.add_field("Content-Length", bytes_sent_for_part)
-      req.body = file_part_data
+      req.add_field("Content-Length", chunk.size)
+      req.body = chunk
+
       http = Net::HTTP.new(req.uri.host, req.uri.port)
       http.use_ssl = (req.uri.scheme == 'https')
       res = http.start {|_http| _http.request(req)}
-      case res
-      when Net::HTTPSuccess then
-        JSON.parse(res.body)
-      when Net::HTTPRedirection then
-        fetch(res['location'], limit - 1)
-      else
-        JSON.parse(res.body)
-      end
-      # Prepare for the next iteration of the loop
-      total_bytes_sent += bytes_sent_for_part 
-      #offset = total_bytes_sent
+
+      raise res.inspect unless res.is_a?(Net::HTTPOK)
+
       sha1_part_index += 1
     end
 
-    b2_command(
+    res = b2_command(
       :b2_finish_large_file,
       body: {
         fileId: file_id,
         partSha1Array: sha1_of_parts
       }
     )
+
+    raise 'fog-backblaze error: ' + res.inspect if res.status != 200
+
+    # res.json['contentLength']
+
+    # was soll der caller mit der response?!
+    res
   end
 
   def handle_small_object_upload(bucket_id, bucket_name, file_path, content, options = {})

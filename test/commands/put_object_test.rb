@@ -11,6 +11,26 @@ describe "put_object" do
     assert_in_delta(response['uploadTimestamp'], Time.now.to_i * 1000, 100_000)
   end
 
+  it "should be able to utilize multipart upload with IO or String" do
+    skip "unskip if needed, it does a large upload (10MB)"
+
+    # more than 10_000_000 bytes (one part must be 5MB or more)
+    content = StringIO.new(Time.now.to_s * 400_001)
+    assert(content.size > 10_000_000)
+
+    response = CONNECTION.put_object(
+      TEST_BUCKET,
+      'test-put_object multipart',
+      content, force_multipart_upload: true
+    ).json
+
+    assert_equal('upload',     response['action'])
+    assert_equal(content.size, response['contentLength'])
+
+    assert(response['fileId'] =~ /.+/)
+    assert_in_delta(response['uploadTimestamp'], Time.now.to_i * 1000, 100_000)
+  end
+
   it "should raise error when name is invalid" do
     error = assert_raises do
       CONNECTION.put_object(TEST_BUCKET, "test-put_object" * 70, "aaa")
